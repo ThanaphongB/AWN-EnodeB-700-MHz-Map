@@ -1,0 +1,103 @@
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+const admin = require('firebase-admin');
+const serviceAccount = require('./login-mnoc-700-mhz-firebase-adminsdk-fbsvc-bfbd0dd4b5.json');
+
+// === 🔐 Firebase Init ===
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: "https://login-mnoc-700-mhz-default-rtdb.asia-southeast1.firebasedatabase.app"
+});
+const db = admin.database();
+
+const token = '8445412019:AAE46kx1ltjGQVgGLopD1aTymeo_B9adigQ'; // 🛑 ปลอดภัย: อย่าแชร์ token จริง
+const bot = new TelegramBot(token, { polling: true });
+console.log("🤖 Telegram Bot is running...");
+
+// === 📦 Parser ฟังก์ชัน ===
+function parseTelegramAlarm(text) {
+  const lines = text.trim().split("\n");
+  const result = {};
+
+  for (const line of lines) {
+    const [key, ...rest] = line.split(":");
+    const value = rest.join(":").trim();
+
+    if (key.includes("NE group")) result.ne_group = value;
+    else if (key.includes("Alarm Occurred")) result.alarm_occurred = value;
+    else if (key.includes("Alarm Cleared")) result.status = value ? "NORMAL" : "DOWN";
+    else if (key.includes("Severity")) result.severity = value;
+    else if (key.includes("Alarm Name")) result.alarm_name = value;
+    else if (key.includes("NE Type")) result.ne_type = value;
+    else if (key.includes("eNodeB ID")) result.id = value;
+    else if (key.includes("Location")) result.location = value;
+    else if (key.includes("Region")) result.region = value;
+  }
+
+  return result.id ? { [result.id]: result } : null;
+}
+
+// === 📥 Bot Message Handler ===
+bot.on('message', (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text;
+
+  console.log(`[MSG] ${text}`);
+
+  // 1️⃣ พยายาม parse แบบ Alarm เต็ม
+  const parsed = parseTelegramAlarm(text);
+  if (parsed) {
+    const enodebId = Object.keys(parsed)[0];
+    const data = parsed[enodebId];
+
+    data.updated = Date.now();
+
+    db.ref("enodeb_alarms/" + enodebId).set(data)
+      .then(() => {
+        console.log(`✅ Alarm saved: ${enodebId}`);
+        bot.sendMessage(chatId, `📡 บันทึก Alarm สำหรับ EnodeB ${enodebId} แล้ว (สถานะ: ${data.status})`);
+      })
+      .catch((err) => {
+        console.error("❌ Firebase error:", err);
+        bot.sendMessage(chatId, "⚠️ ไม่สามารถบันทึกลง Firebase ได้");
+      });
+    return;
+  }
+
+  // 2️⃣ Fallback: ตรวจรูปแบบสั้นๆ เช่น EnodeB 123456 is DOWN
+  const patterns = [
+    /(?:EnodeB|eNodeB|Site)?\s*(\d{5,6})\s*(?:is|status:|->)?\s*(DOWN|UP|Normal)/i,
+    /⛔\s*EnodeB\s*(\d{5,6})\s*is\s*DOWN/i,
+    /✅\s*EnodeB\s*(\d{5,6})\s*is\s*UP/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const enodebId = match[1];
+      const rawStatus = match[2]?.toUpperCase() || 'UNKNOWN';
+      const status = (rawStatus === 'DOWN') ? 'DOWN' : 'NORMAL';
+
+      const data = {
+        status: status,
+        updated: Date.now()
+      };
+
+      db.ref("enodeb_alarms/" + enodebId).set(data)
+        .then(() => {
+          console.log(`📡 Saved simple format: EnodeB ${enodebId} => ${status}`);
+          bot.sendMessage(chatId, `📡 EnodeB ${enodebId} ถูกตั้งค่าเป็น "${status}" แล้ว`);
+        })
+        .catch((err) => {
+          console.error('❌ Firebase error:', err);
+          bot.sendMessage(chatId, "⚠️ บันทึกไม่สำเร็จ");
+        });
+      return;
+    }
+  }
+
+  // ❌ ถ้าไม่เข้าเงื่อนไขใดเลย
+  bot.sendMessage(chatId,
+    "❌ ไม่พบรูปแบบข้อความที่รองรับ\n\nสามารถส่ง:\n• EnodeB 123456 is DOWN\nหรือ\n• ข้อความ Alarm เต็มแบบระบบ"
+  );
+});
