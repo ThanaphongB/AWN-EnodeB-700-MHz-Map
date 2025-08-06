@@ -1,3 +1,5 @@
 pip install telethon firebase-admin
 npm init -y
 npm install express firebase-admin body-parser
+
+login-mnoc-700-mhz-firebase-adminsdk-fbsvc-441f91667b.json
