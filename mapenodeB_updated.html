@@ -2,9 +2,9 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>AWN EnodeB 700 MHz Map</title>
+  <title>AWN EnodeB Map</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  
+
   <!-- Leaflet CSS -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
@@ -12,7 +12,6 @@
 
   <style>
     #map { height: 100vh; }
-
     #controls {
       position: absolute;
       top: 50%;
@@ -27,18 +26,15 @@
       font-size: 14px;
       min-width: 240px;
     }
-
     .form-group {
       display: flex;
       flex-direction: column;
       margin-bottom: 10px;
     }
-
     .form-group label {
       font-weight: bold;
       margin-bottom: 4px;
     }
-
     .form-group select,
     .form-group input {
       padding: 6px 8px;
@@ -46,20 +42,17 @@
       border: 1px solid #ccc;
       font-size: 13px;
     }
-
     .form-group input:focus,
     .form-group select:focus {
       border-color: #4285F4;
       box-shadow: 0 0 2px rgba(66,133,244,0.6);
       outline: none;
     }
-
     .export-buttons {
       display: flex;
       flex-direction: column;
       gap: 5px;
     }
-
     .export-buttons button {
       padding: 6px;
       font-size: 13px;
@@ -69,14 +62,12 @@
       color: white;
       cursor: pointer;
     }
-
     .export-buttons button:hover {
       background: #3367D6;
     }
   </style>
 </head>
 <body>
-
 <div id="controls">
   <div class="form-group">
     <label for="regionSelect">📍 Region:</label>
@@ -91,6 +82,11 @@
   <div class="form-group">
     <label for="enodebInput">📡 EnodeB ID:</label>
     <input type="text" id="enodebInput" placeholder="เช่น 150628" />
+  </div>
+
+  <div class="form-group">
+    <label for="siteCodeInput">🏷 AWN Site Code:</label>
+    <input type="text" id="siteCodeInput" placeholder="เช่น HIYOM" />
   </div>
 
   <div class="form-group">
@@ -110,10 +106,11 @@
 
 <div id="map"></div>
 
-<!-- Leaflet + Firebase -->
+<!-- Leaflet JS -->
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 
+<!-- Main App Script -->
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
@@ -137,6 +134,8 @@
   let currentLayer = null;
   let markers = L.markerClusterGroup();
   let filteredFeatures = [];
+  let autoFit = true;
+  let updateTimer = null;
 
   const map = L.map("map").setView([15.8700, 100.9925], 6);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -144,15 +143,24 @@
     attribution: "© OpenStreetMap"
   }).addTo(map);
 
+  map.on("movestart", () => autoFit = false); // 🛑 ปิด fitBounds เมื่อ user เลื่อน map เอง
+
   const regionSelect = document.getElementById("regionSelect");
   const searchInput = document.getElementById("searchInput");
   const enodebInput = document.getElementById("enodebInput");
+  const siteCodeInput = document.getElementById("siteCodeInput");
   const statusSelect = document.getElementById("statusSelect");
 
-  regionSelect.addEventListener("change", updateMap);
-  searchInput.addEventListener("input", updateMap);
-  enodebInput.addEventListener("input", updateMap);
-  statusSelect.addEventListener("change", updateMap);
+  [regionSelect, searchInput, enodebInput, siteCodeInput, statusSelect].forEach(el => {
+    el.addEventListener("input", debouncedUpdate);
+    el.addEventListener("change", debouncedUpdate);
+  });
+
+  function debouncedUpdate() {
+    autoFit = true; // ✅ เปิดให้ zoom ใหม่ (ถ้า user กำลัง filter)
+    clearTimeout(updateTimer);
+    updateTimer = setTimeout(updateMap,1000);
+  }
 
   fetch("awn_sites_with_enodeb.geojson")
     .then(res => res.json())
@@ -169,111 +177,97 @@
         regionSelect.appendChild(opt);
       });
       updateMap();
+    })
+    .catch(err => {
+      alert("❌ โหลด GeoJSON ไม่สำเร็จ");
+      console.error("GeoJSON Load Error:", err);
     });
 
   onValue(ref(db, "enodeb_alarms"), snapshot => {
     enodebAlarms = snapshot.val() || {};
-    updateMap();
+    debouncedUpdate();
   });
 
   function updateMap() {
     const selectedRegion = regionSelect.value.trim();
     const keyword = searchInput.value.trim().toLowerCase();
     const enodebKeyword = enodebInput.value.trim().toLowerCase();
+    const siteCodeKeyword = siteCodeInput.value.trim().toLowerCase();
     const selectedStatus = statusSelect.value;
 
     if (currentLayer) {
-      markers.clearLayers();
-      map.removeLayer(markers);
+      markers.removeLayer(currentLayer);
     }
 
     filteredFeatures = geojsonData.features.filter(f => {
-  const p = f.properties;
-  const enodebId = p["EnodeB ID"]?.toString();
-  const alarmStatus = enodebId && enodebAlarms[enodebId]?.status;
-  const isDown = alarmStatus === "DOWN";
-  const isUp = alarmStatus === "UP";
+      const p = f.properties;
+      const enodebId = p["EnodeB ID"]?.toString();
+      const alarmStatus = enodebId && enodebAlarms[enodebId]?.status;
+      const isDown = alarmStatus === "DOWN";
+      const isNormal = !isDown;
 
-  const regionMatch = selectedRegion ? p.Region === selectedRegion : true;
-  const keywordMatch = keyword === "" || [p["AWN Site Code"], p["Province"], p["District"], p["Subdistrict"]]
-    .filter(Boolean)
-    .some(val => val.toLowerCase().includes(keyword));
-  const enodebMatch = enodebKeyword === "" ||
-    (p["EnodeB ID"] && p["EnodeB ID"].toString().toLowerCase().includes(enodebKeyword));
-  const statusMatch =
-    selectedStatus === "" ||
-    (selectedStatus === "down" && isDown) ||
-    (selectedStatus === "normal" && isUp);
+      const regionMatch = selectedRegion ? p.Region === selectedRegion : true;
+      const keywordMatch = keyword === "" || [p["Province"], p["District"], p["Subdistrict"]].some(val => val?.toLowerCase().includes(keyword));
+      const enodebMatch = enodebKeyword === "" || enodebId?.toLowerCase().includes(enodebKeyword);
+      const siteCodeMatch = siteCodeKeyword === "" || p["AWN Site Code"]?.toLowerCase().includes(siteCodeKeyword);
+      const statusMatch = selectedStatus === "" ||
+                          (selectedStatus === "down" && isDown) ||
+                          (selectedStatus === "normal" && isNormal);
 
-  return regionMatch && keywordMatch && enodebMatch && statusMatch;
-});
+      return regionMatch && keywordMatch && enodebMatch && siteCodeMatch && statusMatch;
+    });
 
-const layer = L.geoJSON({ type: "FeatureCollection", features: filteredFeatures }, {
-  pointToLayer: (f, latlng) => {
-    const p = f.properties;
-    const enodebId = p["EnodeB ID"]?.toString();
-    const alarm = enodebId && enodebAlarms[enodebId];
-    const statusText = alarm?.status === "DOWN" ? "⛔ DOWN" :
-                       alarm?.status === "UP"   ? "✅ Normal" :
-                       "❓ Unknown";
+    const layer = L.geoJSON({ type: "FeatureCollection", features: filteredFeatures }, {
+      pointToLayer: (f, latlng) => {
+        const p = f.properties;
+        const enodebId = p["EnodeB ID"]?.toString();
+        const alarm = enodebAlarms[enodebId];
+        const isDown = alarm?.status === "DOWN";
 
-    const icon = alarm?.status === "DOWN" ? redIcon() : blueIcon();
+        const markerIcon = L.icon({
+          iconUrl: isDown ? 'https://maps.google.com/mapfiles/ms/icons/red-dot.png' : 'https://maps.google.com/mapfiles/ms/icons/green-dot.png',
+          iconSize: [32, 32],
+          iconAnchor: [16, 32],
+          popupAnchor: [0, -32]
+        });
 
-    const lat = f.geometry.coordinates[1];
-    const lng = f.geometry.coordinates[0];
-    const popup = `
-      <b>Status:</b> ${statusText}<br/>
-      <b>AWN Site Code:</b> ${p["AWN Site Code"] || "-"}<br/>
-      <b>EnodeB ID:</b> ${p["EnodeB ID"] || "-"}<br/>
-      <b>จังหวัด:</b> ${p["Province"] || "-"}<br/>
-      <b>อำเภอ:</b> ${p["District"] || "-"}<br/>
-      <b>ตำบล:</b> ${p["Subdistrict"] || "-"}<br/>
-      <b>Region:</b> ${p["Region"] || "-"}<br/>
-      <b>Lat:</b> ${lat.toFixed(6)}<br/>
-      <b>Long:</b> ${lng.toFixed(6)}<br/>
-      🔎 <a href="https://www.google.com/maps?q=${lat},${lng}" target="_blank">เปิดใน Google Maps</a>
-    `;
+        const statusHtml = isDown
+          ? `<span style="color:red;">⛔ Down</span>`
+          : `<span style="color:green;">✅ On Service</span>`;
 
-    const marker = L.marker(latlng, { icon });
-    marker.bindPopup(popup);
-    return marker;
-  }
-});
+        const popupContent = `
+          <b>Status:</b> ${statusHtml}<br>
+          <b>AWN Site Code:</b> ${p["AWN Site Code"] || "-"}<br>
+          <b>EnodeB ID:</b> ${enodebId || "-"}<br>
+          จังหวัด: ${p["Province"] || "-"}<br>
+          อำเภอ: ${p["District"] || "-"}<br>
+          ตำบล: ${(p["Subdistrict"] || "-").replace(/^ตำบล\s*/, "")}<br>
+          Region: ${p["Region"] || "-"}<br>
+          Lat: ${latlng.lat.toFixed(6)}<br>
+          Long: ${latlng.lng.toFixed(6)}<br>
+          🔎 <a href="https://www.google.com/maps/search/?api=1&query=${latlng.lat},${latlng.lng}" target="_blank">เปิดใน Google Maps</a>
+        `;
+
+        return L.marker(latlng, { icon: markerIcon }).bindPopup(popupContent);
+      }
+    });
 
     currentLayer = layer;
-    markers = L.markerClusterGroup();
+    if (!map.hasLayer(markers)) map.addLayer(markers);
+    markers.clearLayers();
     markers.addLayer(currentLayer);
-    map.addLayer(markers);
 
-    if (filteredFeatures.length > 0 && currentLayer.getBounds().isValid()) {
+    if (filteredFeatures.length > 0 && currentLayer.getBounds().isValid() && autoFit) {
       map.fitBounds(currentLayer.getBounds());
     }
   }
 
-  function redIcon() {
-    return new L.Icon({
-      iconUrl: 'https://maps.google.com/mapfiles/ms/icons/red-dot.png',
-      iconSize: [32, 32],
-      iconAnchor: [16, 32],
-      popupAnchor: [0, -32]
-    });
-  }
-
-  function blueIcon() {
-    return new L.Icon({
-      iconUrl: 'https://maps.google.com/mapfiles/ms/icons/blue-dot.png',
-      iconSize: [32, 32],
-      iconAnchor: [16, 32],
-      popupAnchor: [0, -32]
-    });
-  }
-
-  // ✅ Export CSV
   window.exportCSV = function () {
     const rows = filteredFeatures.map(f => {
       const p = f.properties;
+      const status = enodebAlarms[p["EnodeB ID"]]?.status === "DOWN" ? "DOWN" : "Normal";
       return {
-        Status: enodebAlarms[p["EnodeB ID"]] ? "DOWN" : "Normal",
+        Status: status,
         "AWN Site Code": p["AWN Site Code"] || "",
         "EnodeB ID": p["EnodeB ID"] || "",
         Province: p["Province"] || "",
@@ -281,15 +275,11 @@ const layer = L.geoJSON({ type: "FeatureCollection", features: filteredFeatures 
         Subdistrict: p["Subdistrict"] || "",
         Region: p["Region"] || "",
         Lat: f.geometry.coordinates[1],
-        Long: f.geometry.coordinates[0],
+        Long: f.geometry.coordinates[0]
       };
     });
 
-    const csvContent = [
-      Object.keys(rows[0]).join(","),
-      ...rows.map(row => Object.values(row).join(","))
-    ].join("\n");
-
+    const csvContent = [Object.keys(rows[0]).join(","), ...rows.map(row => Object.values(row).join(","))].join("\n");
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -299,12 +289,8 @@ const layer = L.geoJSON({ type: "FeatureCollection", features: filteredFeatures 
     URL.revokeObjectURL(url);
   };
 
-  // ✅ Export GeoJSON
   window.exportGeoJSON = function () {
-    const data = {
-      type: "FeatureCollection",
-      features: filteredFeatures
-    };
+    const data = { type: "FeatureCollection", features: filteredFeatures };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
