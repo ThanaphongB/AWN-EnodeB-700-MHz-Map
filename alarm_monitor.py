@@ -1,108 +1,142 @@
+# -*- coding: utf-8 -*-
+import re
+import socks
+from datetime import datetime, timezone, timedelta
+import asyncio
+
 from telethon import TelegramClient, events
 import firebase_admin
 from firebase_admin import credentials, db
-import re
-from datetime import datetime, timezone, timedelta
 
 # --- Telegram Config ---
 api_id = 20801702
-api_hash = 'ab8e072323be623961c22fa7ca42093a' # ตรวจสอบให้แน่ใจว่าเป็น api_hash ที่ถูกต้องของคุณ
+api_hash = 'ab8e072323be623961c22fa7ca42093a'
 session_name = 'alarm_session'
-group_chat_id = -1002771373578 # **สำคัญ:** เปลี่ยนเป็น Group ID ที่ถูกต้องของคุณ
+group_chat_id = -1002771373578
+
+# --- Proxy Config ---
+proxy_address = '10.100.80.239'
+proxy_port = 8080
+proxy_type = socks.HTTP  # หรือ socks.SOCKS5
 
 # --- Firebase Config ---
-# ตรวจสอบให้แน่ใจว่าไฟล์ service account key อยู่ในไดเรกทอรีเดียวกันกับสคริปต์ Python นี้
 cred = credentials.Certificate('login-mnoc-700-mhz-firebase-adminsdk-fbsvc-c899293b15.json')
 firebase_admin.initialize_app(cred, {
     'databaseURL': 'https://login-mnoc-700-mhz-default-rtdb.asia-southeast1.firebasedatabase.app'
 })
-# Path ใน Firebase ที่เก็บข้อมูลสถานะ EnodeB
 firebase_enodeb_alarms_ref = db.reference('/enodeb_alarms')
+firebase_enodeb_history_ref = db.reference('/enodeb_alarms_history')
 
-# --- Helper Function: สำหรับแยกวิเคราะห์ข้อมูลจากข้อความ Telegram ---
+# --- Helper: Parse Telegram alarm message ---
 def parse_alarm_data(message_text):
-    enodeb_id = None
-    status_raw = None
-    alarm_occurred = None
-    alarm_cleared = None
-    eNodeB_Site_Code = None
-    
-    # ดึง EnodeB ID
-    m = re.search(r"eNodeB ID\s*:\s*(\d+)", message_text)
-    if m:
-        enodeb_id = m.group(1)
-
-    # ดึง Status (Uncleared หรือ Cleared)
-    m2 = re.search(r"Status\s*:\s*(\w+)", message_text)
-    if m2:
-        status_raw = m2.group(1).strip().upper()
-
-    # แปลง Status เป็น DOWN / NORMAL
-    status = "DOWN" if status_raw == "UNCLEARED" else "NORMAL"
-
-    # เวลาไทย (UTC+7)
     tz = timezone(timedelta(hours=7))
 
-    # ดึงเวลา Alarm Occurred
-    m3 = re.search(r"Alarm Occurred\s*:\s*([\d\-]+\s[\d:]+)", message_text)
-    if m3:
-        alarm_occurred = datetime.strptime(m3.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz).isoformat()
+    enodeb_id = re.search(r"eNodeB ID\s*:\s*(\d+)", message_text)
+    status_raw = re.search(r"Status\s*:\s*([^\r\n]+)", message_text, re.IGNORECASE)
+    occurred = re.search(r"Alarm Occurred\s*:\s*([\d\-]+\s[\d:]+)", message_text)
+    cleared = re.search(r"Alarm Cleared\s*:\s*([\d\-]+\s[\d:]+)?", message_text)
+    site_code = re.search(r"eNodeB Site Code\s*:\s*([\w\-]+)", message_text)
 
-    # ดึงเวลา Alarm Cleared (อาจไม่มี)
-    m4 = re.search(r"Alarm Cleared\s*:\s*([\d\-]+\s[\d:]+)", message_text)
-    if m4:
-        alarm_cleared = datetime.strptime(m4.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz).isoformat()
+    enodeb_id = enodeb_id.group(1).strip() if enodeb_id else None
+
+    # Logic: Uncleared = DOWN, else = NORMAL
+    if status_raw:
+        status_text = status_raw.group(1).strip().upper()
+        status = "DOWN" if status_text == "UNCLEARED" else "NORMAL"
     else:
-        alarm_cleared = ""  # ตั้งเป็นสตริงว่างถ้าไม่มีข้อมูล
+        status = "NORMAL"
 
-    # ดึง eNodeB Site Code (ถ้ามี)
-    m5 = re.search(r"eNodeB Site Code\s*:\s*([A-Za-z0-9]+)", message_text)
-    if m5:
-        eNodeB_Site_Code = m5.group(1).strip()
-    
-    return enodeb_id, status, alarm_occurred, alarm_cleared, eNodeB_Site_Code
+    occurred = datetime.strptime(occurred.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz).isoformat() if occurred else None
+    cleared = datetime.strptime(cleared.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz).isoformat() if cleared and cleared.group(1) else ""
+    site_code = site_code.group(1).strip() if site_code else None
 
+    print(f"Parsed Data -> EnodeB: {enodeb_id}, Status: {status}, Occurred: {occurred}, Cleared: {cleared}, Site: {site_code}")
+    return enodeb_id, status, occurred, cleared, site_code
 
-# --- Telegram Handler: ตรวจจับข้อความใหม่ในกลุ่ม ---
-client = TelegramClient(session_name, api_id, api_hash)
+# --- Check Proxy ---
+def check_proxy_connection(proxy_type, proxy_addr, proxy_port):
+    import socket as pysocket
+    try:
+        s = socks.socksocket()
+        s.settimeout(10)
+        s.set_proxy(proxy_type, proxy_addr, proxy_port)
+        s.connect(('api.telegram.org', 443))
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ Proxy connection successful.")
+        s.close()
+        return True
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ❌ Proxy failed: {e}")
+        return False
 
-@client.on(events.NewMessage(chats=group_chat_id))
-async def alarm_handler(event):
-    
-    text = event.raw_text
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 📩 New Message:\n{text}")
+# --- Main Async Function ---
+async def main():
+    if not check_proxy_connection(proxy_type, proxy_address, proxy_port):
+        print("Exiting program due to failed proxy connection.")
+        return
 
-    if 'Alarm Name' in text and 'eNodeB ID' in text:
-        enodeb_id, new_status, occurred, cleared, site_code = parse_alarm_data(text)
+    client = TelegramClient(session_name, api_id, api_hash, proxy=(proxy_type, proxy_address, proxy_port))
 
-        if enodeb_id:
-            current_data = firebase_enodeb_alarms_ref.child(enodeb_id).get()
-            current_status = current_data.get('status') if current_data else None
+    # --- Connect Telegram ---
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ❌ Session ไม่ถูกต้องหรือหมดอายุ. สร้าง session ใหม่ด้วย create_alarm_session.py")
+            return
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ❌ Cannot connect Telegram: {e}")
+        return
 
-            data_to_update = {
-                'status': new_status,
-                'alarm_occurred': occurred,
-                'alarm_cleared': cleared,
-                'last_update': datetime.now(timezone(timedelta(hours=7))).isoformat()
-            }
+    # --- Event Handler ---
+    @client.on(events.NewMessage(chats=group_chat_id))
+    async def alarm_handler(event):
+        text = event.message.message if hasattr(event.message, "message") else event.raw_text
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 📩 New Message:\n{text!r}")
 
-            # เพิ่ม eNodeB Site Code ถ้ามี
-            if site_code:
-                data_to_update['eNodeB_Site_Code'] = site_code
+        if 'Alarm Name' in text and 'eNodeB ID' in text:
+            enodeb_id, new_status, occurred, cleared, site_code = parse_alarm_data(text)
 
-            if new_status != current_status:
-                firebase_enodeb_alarms_ref.child(enodeb_id).set(data_to_update)
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ Status changed! Updated Firebase for EnodeB {enodeb_id} to {new_status}")
+            if enodeb_id:
+                # ข้อมูลสำหรับ status ปัจจุบัน
+                data_to_update = {
+                    'status': new_status,
+                    'alarm_occurred': occurred,
+                    'alarm_cleared': cleared,
+                    'last_update': datetime.now(timezone(timedelta(hours=7))).isoformat()
+                }
+                if site_code:
+                    data_to_update['eNodeB_Site_Code'] = site_code
+
+                # บันทึก status ปัจจุบัน
+                firebase_enodeb_alarms_ref.child(enodeb_id).update(data_to_update)
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ Firebase updated for EnodeB {enodeb_id} to {new_status}")
+
+                # --- บันทึกประวัติ Alarm ---
+                history_entry = {
+                    'status': new_status,
+                    'alarm_occurred': occurred,
+                    'alarm_cleared': cleared,
+                    'eNodeB_Site_Code': site_code,
+                    'raw_message': text,
+                    'timestamp': datetime.now(timezone(timedelta(hours=7))).isoformat()
+                }
+                firebase_enodeb_history_ref.child(enodeb_id).push(history_entry)
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 📝 Alarm history saved for EnodeB {enodeb_id}")
+
             else:
-                firebase_enodeb_alarms_ref.child(enodeb_id).update({'last_update': data_to_update['last_update']})
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ℹ️ Status for EnodeB {enodeb_id} is still {new_status}. Only last_update was refreshed.")
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Could not parse EnodeB ID.")
         else:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Could not parse EnodeB ID from message.")
-    else:
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ➡️ Message not an alarm, skipping.")
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ➡️ Not an alarm message. Skipped.")
 
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🚀 Listening for alarms...")
+    await client.run_until_disconnected()
 
-# --- Run the Telegram Client ---
-client.start()
-print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🚀 Listening for alarms...")
-client.run_until_disconnected()
+# --- Run ---
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⏹️ Script stopped by user/PM2.")
+    except asyncio.exceptions.CancelledError:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⏹️ Async tasks cancelled.")
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🛑 Unexpected error: {e}")
