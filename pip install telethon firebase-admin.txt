@@ -3,3 +3,14 @@ npm init -y
 npm install express firebase-admin body-parser
 
 login-mnoc-700-mhz-firebase-adminsdk-fbsvc-441f91667b.json
+
+
+
+//edite PM2 //
+mkdir -p ~/.npm-global
+npm config set prefix '~/.npm-global'
+export PATH="$HOME/.npm-global/bin:$PATH"
+source ~/.bashrc  # หรือ ~/.zshrc
+npm install -g pm2
+pm2 reload react-dev
+pm2 save
